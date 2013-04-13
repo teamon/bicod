@@ -2,7 +2,7 @@
 
 import Test.Hspec
 
-import Bicod
+import Database.Bicod
 
 main = hspec $ do
   describe "Bidoc" $ do

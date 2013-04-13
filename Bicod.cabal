@@ -1,0 +1,28 @@
+name:                 bicod
+version:              0.1.0.0
+synopsis:             Binary compare databases
+-- description:
+homepage:             http://github.com/teamon/bicod
+license:              MIT
+license-file:         LICENSE
+author:               Tymon Tobolski
+maintainer:           i@teamon.eu
+copyright:            Copyright (c) 2013 Tymon Tobolski
+category:             Database
+build-type:           Simple
+cabal-version:        >=1.8
+
+
+library
+  exposed-modules:    Database.Bicod
+  build-depends:      base, text, curl, bytestring, HTTP, aeson
+
+executable bicod
+  main-is:            Database/Bicod/Main.hs
+  -- other-modules:
+  build-depends:      base, text, curl, bytestring, HTTP, aeson, bicod
+
+-- test-suite tests
+--   type:               exitcode-stdio-1.0
+--   main-is:            test/Spec.hs
+--   build-depends:      base, text, hspec
