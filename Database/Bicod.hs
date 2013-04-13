@@ -6,25 +6,30 @@
 
 module Database.Bicod where
 
-import           Control.Arrow
-import           Control.Monad
+
+-- Base
 import           Control.Applicative
-import           Data.Maybe
-import           Data.Functor
-import           Data.Text      hiding (count)
-import           Data.Text.Read (decimal)
-import           Data.Aeson
-import            Data.Aeson.Types
+import           Control.Arrow
+import           Data.ByteString            (ByteString)
 import qualified Data.ByteString.Lazy.Char8 as C8
-import           Network.Curl   (CurlCode (CurlOK), curlGetString)
-import Data.ByteString (ByteString)
+import           Data.Functor
+import           Data.Maybe
+import           Data.Text                  hiding (count, find)
+import           Debug.Trace
 
-import Network.HTTP
+-- ElasticSearch
+import           Data.Aeson
+import           Data.Aeson.Types
+import           Network.HTTP
 
---class DbOps a where
+-- MongoDB
+import           Database.MongoDB           hiding (Host, Value)
+import qualified Database.MongoDB           as M
 
 
---import Database.MongoDB
+dbg :: Show a => a -> a
+dbg x = traceShow x x
+
 
 type V a = Either String a
 type Host = (String, Int) -- hostname and port
@@ -33,27 +38,35 @@ type OpsCount = IO (V Int)
 
 data Sort = ASC | DESC
 
+sortInt :: Sort -> Int
+sortInt ASC   = 1
+sortInt DESC  = -1
+
 instance ToJSON Sort where
   toJSON ASC = "asc"
   toJSON DESC = "desc"
 
-data Ops a = Ops {
-    opsBounds :: Maybe String -> Maybe String -> OpsBounds
-  , opsCount :: Maybe String -> Maybe String -> OpsCount
+data Ops = Ops {
+    opsShow   :: String
+  , opsBounds :: Maybe String -> Maybe String -> OpsBounds
+  , opsCount  :: Maybe String -> Maybe String -> OpsCount
 }
+
+instance Show Ops where
+  show = opsShow
 
 
 
 data ElasticSearch = ElasticSearch {
     esHost  :: Host
   , esIndex :: String
-  -- , esType  :: String
+  , esType  :: String
   , esField :: String
 } deriving (Show)
 
 
 defaultElasticSearch :: ElasticSearch
-defaultElasticSearch = ElasticSearch ("localhost", 9200) "twitter" "id"
+defaultElasticSearch = ElasticSearch ("localhost", 9200) "twitter" "tweet" "id"
 
 
 data EsQueryResult = EsQueryResult {
@@ -75,11 +88,11 @@ decodeEsQueryResult key json = eitherDecode json >>= parseEither parser where
               _       -> return Nothing
 
 esHostString :: ElasticSearch -> String
-esHostString (ElasticSearch (host, port) index _) = host ++ ":" ++ show port
+esHostString (ElasticSearch (host, port) index tp _) = host ++ ":" ++ show port
 
 esURI :: ElasticSearch -> String
-esURI es @ (ElasticSearch (host, port) index _) =
-  "http://" ++ esHostString es ++ "/" ++ index
+esURI es @ (ElasticSearch (host, port) index tp _) =
+  "http://" ++ esHostString es ++ "/" ++ index ++ "/" ++ tp
 
 esSearchQuery :: ElasticSearch -> Maybe String -> Maybe String -> Sort -> IO (V EsQueryResult)
 esSearchQuery es left right sort = parse <$> httpPOST uri headers body where
@@ -107,20 +120,12 @@ esSearchQuery es left right sort = parse <$> httpPOST uri headers body where
     ]
 
 
-
 httpPOST :: String -> [Header] -> String -> IO (V String)
 httpPOST = httpRequest POST
 
 httpRequest :: RequestMethod -> String -> [Header] -> String -> IO (V String)
 httpRequest method uri headers body = do
-  --putStrLn "-->"
-  --print req
-  --putStrLn $ rqBody req
-  --putStrLn ""
   res <- simpleHTTP req
-  --putStrLn "<--"
-  --print res
-  --putStrLn =<< getResponseBody res
 
   return $ f res where
     req = (getRequest uri) { rqMethod = method, rqBody = body, rqHeaders = headers }
@@ -139,9 +144,10 @@ esBounds es left right = (cm <$>) <$> (liftA2 . liftA2)(,) lx rx where
   cm (EsQueryResult _ lh, EsQueryResult _ rh) = (lh, rh)
 
 
-esOps :: ElasticSearch -> Ops ElasticSearch
+esOps :: ElasticSearch -> Ops
 esOps es = Ops {
-    opsCount = esCount es
+    opsShow = show es
+  , opsCount = esCount es
   , opsBounds = esBounds es
 }
 
@@ -153,70 +159,82 @@ esOps es = Ops {
 -- Mongo
 
 data Mongo = Mongo {
-    mongoHost        :: Host
-  , mongoDatabase    :: Text
-  , mondgoCollection :: Text
-  , mongoField       :: Text
+    mongoHost       :: Host
+  , mongoDatabase   :: String
+  , mongoCollection :: String
+  , mongoField      :: String
 } deriving (Show)
+
+mongoHost' :: Mongo -> M.Host
+mongoHost' (Mongo (host, port) _ _ _) =
+  M.Host host (PortNumber $ fromInteger $ toInteger port)
 
 defaultMongo :: Mongo
 defaultMongo = Mongo ("localhost", 27017) "test" "test" "_id"
 
-mongoOps :: Mongo -> Ops Mongo
+mongoCount :: Mongo -> Maybe String -> Maybe String -> OpsCount
+mongoCount mongo left right = mongoRun mongo $ action where
+  action = count $ (mongoQuery mongo left right ASC)
+
+mongoBounds :: Mongo -> Maybe String -> Maybe String -> OpsBounds
+mongoBounds mongo left right = (liftA2 . liftA2)(,) lx rx where
+  lx = run ASC
+  rx = run DESC
+  run s = ((firstKey <$>) <$>) $ mongoRun mongo $ act s >>= rest
+  act s = find $ (mongoQuery mongo left right s) { limit = 1}
+  firstKey ds = show <$> ((listToMaybe ds) >>= M.look field)
+  field = Data.Text.pack (mongoField mongo)
+
+mongoQuery :: Mongo -> Maybe String -> Maybe String -> Sort -> Query
+mongoQuery mongo lx rx sr =
+  (select filt col) { project = [field =: 1], sort = [field =: sortInt sr] } where
+    col     = Data.Text.pack $ mongoCollection mongo
+    field   = Data.Text.pack $ mongoField mongo
+    filt    = case catMaybes [fLeft, fRight] of
+      [] -> []
+      xs -> [field =: xs]
+    fLeft   = (\x -> "$gte" =: typedField x) <$> lx
+    fRight  = (\x -> "$lte" =: typedField x) <$> rx
+    typedField v = read v :: ObjectId
+
+
+mongoRun :: Mongo -> Action IO a -> IO (V a)
+mongoRun mongo action = do
+  pipe  <- runIOE $ connect $ mongoHost' mongo
+  res   <- access pipe master db $ action
+  return $ left show $ res where
+    db = Data.Text.pack $ mongoDatabase mongo
+
+
+mongoOps :: Mongo -> Ops
 mongoOps mongo = Ops {
-    opsCount = undefined
-  , opsBounds = undefined
+    opsShow = show mongo
+  , opsCount = mongoCount mongo
+  , opsBounds = mongoBounds mongo
 }
 
 
 
 
 
-
-
-
-
-opsGlobalBounds :: Ops a -> OpsBounds
+opsGlobalBounds :: Ops -> OpsBounds
 opsGlobalBounds ops = opsBounds ops Nothing Nothing
 
-opsGlobalCount :: Ops a -> OpsCount
+opsGlobalCount :: Ops -> OpsCount
 opsGlobalCount ops = opsCount ops Nothing Nothing
 
-runOps :: Ops a -> Ops b -> IO ()
-runOps b a = do
-  putStr "bound: "
-  print =<< opsGlobalBounds b
-  putStr "count: "
+runOps :: (Ops, Ops) -> IO ()
+runOps (a, b) = do
+  print a
+  putStr " count:  "
+  print =<< opsGlobalCount a
+  putStr " bounds: "
+  print =<< opsGlobalBounds a
+
+  print b
+  putStr " count:  "
   print =<< opsGlobalCount b
-
-  --putStr "bound 1 x: "
-  --print =<< opsBounds b (Just "1") Nothing
-  --putStr "count 1 x: "
-  --print =<< opsCount b (Just "1") Nothing
-
-  --putStr "bound 1 2: "
-  --print =<< opsBounds b (Just "1") (Just "2")
-  --putStr "count 1 2: "
-  --print =<< opsCount b (Just "1") (Just "2")
-
-  --putStr "bound 1 3: "
-  --print =<< opsBounds b (Just "1") (Just "3")
-  --putStr "count 1 3: "
-  --print =<< opsCount b (Just "1") (Just "3")
-
-  --putStr "bound x 1: "
-  --print =<< opsBounds b Nothing (Just "1")
-  --putStr "count x 1: "
-  --print =<< opsCount b Nothing (Just "1")
-
-  --putStr "bound x 2: "
-  --print =<< opsBounds b Nothing (Just "2")
-  --putStr "count x 2: "
-  --print =<< opsCount b Nothing (Just "2")
-
-  --putStr "bound 2 3: "
-  --print =<< opsBounds b (Just "2") (Just "3")
-  --putStr "count 2 3: "
-  --print =<< opsCount b (Just "2") (Just "3")
+  putStr " bounds: "
+  print =<< opsGlobalBounds b
 
 
