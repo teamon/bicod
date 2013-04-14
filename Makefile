@@ -1,5 +1,9 @@
-# OPTS = -fwarn-incomplete-patterns
-RUNHS = runhaskell $(OPTS)
+# OPTS = +RTS -prof -xc --RTS
+RUNHS = runghc $(OPTS)
+
+all:
+	$(RUNHS) Setup.hs configure
+	$(RUNHS) Setup.hs build
 
 run:
 	$(RUNHS) Database/Bicod/Main.hs
@@ -7,7 +11,7 @@ run:
 autorun:
 	rerun -p "**/*.hs" "make run"
 
-test:
+test: test/Spec.hs
 	$(RUNHS) test/Spec.hs
 
 autotest:

@@ -2,16 +2,18 @@
 
 import Test.Hspec
 import Test.QuickCheck
+import Test.QuickCheck.Monadic (assert, monadicIO)
 import Data.Functor
 import Control.Monad
 
 import Database.Bicod
+import Database.MongoDB
 
-newtype Alpha = Alpha { runAplha :: [Char] } deriving (Eq, Show)
+--newtype Alpha = Alpha { runAplha :: [Char] } deriving (Eq, Show)
 
-instance Arbitrary Alpha where
-    arbitrary     = liftM (Alpha . filter (`elem` ['0'..'z'])) $ arbitrary
-    --coarbitrary c = variant (ord c `rem` 4)
+--instance Arbitrary ObjectId where
+    --arbitrary     = genObjectId -- liftM (Alpha . filter (`elem` ['0'..'z'])) $ arbitrary
+--    --coarbitrary c = variant (ord c `rem` 4)
 
 main = hspec $ do
   describe "Bidoc" $ do
@@ -34,12 +36,21 @@ main = hspec $ do
 
 
       describe "Pivot" $ do
-        it "Calculate filed <-> integer isomorphism" $ verboseCheck $
-          \x -> (Alpha $ (opsIntegerToField . opsFieldToInteger) $ runAplha x) == (x :: Alpha)
+        --it "Return the same id" $ monadicIO $ do
+        --  oid <- genObjectId
+        --  assert $ pivot oid oid == oid
 
         it "should work for numbers" $ do
-          opsFieldPivot "123456" "543210" `shouldBe` "333333"
+          pivot "123456" "543210" `shouldBe` "333333"
 
         it "should work for mongo oid" $ do
-          opsFieldPivot "5169926decd2f29305538415" "5169952687b1cd974758065a" `shouldBe` "516993YrtMc2?K952655YZXpU"
+          pivot a b `shouldBe` c
+            where
+              a = read "5169926decd2f29305538415" :: ObjectId
+              b = read "5169952687b1cd974758065a" :: ObjectId
+              c = read "516993ca3a4260152655c537" :: ObjectId
+
+
+
+
 

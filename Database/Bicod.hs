@@ -14,6 +14,8 @@ module Database.Bicod where
 -- Base
 import           Control.Applicative
 import           Control.Arrow
+import           Control.Monad.Trans        (liftIO)
+import           Control.Monad.Trans.Either hiding (left)
 import           Data.ByteString            (ByteString)
 import qualified Data.ByteString.Lazy.Char8 as C8
 import           Data.Functor
@@ -22,6 +24,9 @@ import           Data.Text                  as T (pack, splitOn, unpack)
 import           Data.Text                  hiding (count, find, split)
 import           Data.Text.Read             (decimal)
 import           Data.Char
+import           Data.List                  (elemIndex)
+import           Data.Set (Set)
+import qualified Data.Set                   as Set
 import           Debug.Trace
 
 -- ElasticSearch
@@ -44,8 +49,14 @@ dbgf s f a = trace (s ++ " <-- " ++ show a) $ trace (s ++ " --> " ++ show b) b w
 
 type V a = Either String a
 type Host = (String, Int) -- hostname and port
-type OpsBounds a = IO (V (Maybe a, Maybe a))
-type OpsCount = IO (V Int)
+
+data OpsBounds a = OpsBounds {
+    boundLeft   :: Maybe a
+  , boundRight  :: Maybe a
+  , boundCount  :: Int
+} deriving (Eq, Show)
+
+type OpsResult a = IO (V (OpsBounds a))
 
 data Sort = ASC | DESC
 
@@ -59,12 +70,39 @@ instance ToJSON Sort where
 
 data Ops a = Ops {
     opsShow   :: String
-  , opsBounds :: Maybe a -> Maybe a -> OpsBounds a
-  , opsCount  :: Maybe a -> Maybe a -> OpsCount
+  , opsBounds :: Maybe a -> Maybe a -> OpsResult a
 }
 
 instance Show (Ops a) where
   show = opsShow
+
+
+class Pivot a where
+  pivot :: a -> a -> a
+
+instance Pivot String where
+  pivot = pivotString c2i i2c 75 where
+    c2i = (toInteger . subtract 48 . ord)
+    i2c = (chr . fromIntegral . (+) 48)
+
+instance Pivot ObjectId where
+  pivot a b = read $ pivotString c2i i2c 16 (show a) (show b) where
+    c2i c = toInteger $ fromMaybe 0 $ elemIndex c xs
+    i2c i = xs !! (fromIntegral i)
+    xs = ['0'..'9'] ++ ['a'..'f']
+
+
+pivotString :: (Char -> Integer) -> (Integer -> Char) -> Integer -> (String -> String -> String)
+pivotString c2i i2c base a b = i2f $ (a' + b') `div` 2 where
+  a' = f2i a
+  b' = f2i b
+  i2f :: Integer -> String
+  i2f x = fmap i2c $ Prelude.reverse $ skipZero $ f x where
+    f x = if x <= 0 then [] else (x `mod` base) : f (x `div` base)
+    skipZero (0:xs) = xs
+    skipZero xs     = xs
+  f2i :: String -> Integer
+  f2i x = Prelude.foldl (\a (i,e) -> e * base^i + a) 0 $ Prelude.zip [0..] $ fmap c2i $ Prelude.reverse x
 
 
 
@@ -156,28 +194,22 @@ instance EsConv String where
 
 instance EsConv ObjectId where
   esConvTo = show
-  esConvFrom v = fst <$> (listToMaybe $ reads v)
+  esConvFrom v = fst <$> listToMaybe (reads v)
 
 
-esCount :: (EsConv a) => ElasticSearch -> Maybe a -> Maybe a -> OpsCount
-esCount es left right = (esTotal <$>) <$> esSearchQuery es left right ASC
-
-esBounds :: (EsConv a) => ElasticSearch -> Maybe a -> Maybe a -> OpsBounds a
+esBounds :: (EsConv a) => ElasticSearch -> Maybe a -> Maybe a -> OpsResult a
 esBounds es left right = (cm <$>) <$> (liftA2 . liftA2)(,) lx rx where
   lx = query ASC
   rx = query DESC
   query = esSearchQuery es left right
-  cm (EsQueryResult _ lh, EsQueryResult _ rh) = (lh, rh)
+  cm (EsQueryResult t lh, EsQueryResult _ rh) = OpsBounds lh rh t
 
 
 esOps :: (Show a, EsConv a) => ElasticSearch -> Ops a
 esOps es = Ops {
     opsShow = show es
-  , opsCount = esCount es
   , opsBounds = esBounds es
 }
-
-
 
 
 
@@ -198,19 +230,14 @@ mongoHost' (Mongo (host, port) _ _ _) =
 defaultMongo :: Mongo
 defaultMongo = Mongo ("localhost", 27017) "test" "test" "_id"
 
-mongoCount :: (Show a, Val a) => Mongo -> Maybe a -> Maybe a -> OpsCount
-mongoCount mongo left right = mongoRun mongo $ action where
-  action = count $ (mongoQuery mongo left right ASC)
-
-mongoBounds :: (Show a, Val a) => Mongo -> Maybe a -> Maybe a -> OpsBounds a
-mongoBounds mongo left right = (liftA2 . liftA2)(,) lx rx where
+mongoBounds :: (Show a, Val a) => Mongo -> Maybe a -> Maybe a -> OpsResult a
+mongoBounds mongo left right = (liftA3 . liftA3) OpsBounds lx rx cn where
   lx = run ASC
   rx = run DESC
+  cn = mongoRun mongo action where
+    action = count $ mongoQuery mongo left right ASC
   run s = ((getField <$>) <$>) $ mongoRun mongo $ act s
   act s = findOne $ (mongoQuery mongo left right s) { limit = 1}
-  --firstKey :: (Show a, Read a) => [Document] -> Maybe a
-  --firstKey ds = dbgf "read" read <$> firstKey' ds
-  --getField :: (Val a) => Maybe Document -> Maybe a
   getField doc = doc >>= M.look field >>= cast'
   field = Data.Text.pack (mongoField mongo)
 
@@ -224,62 +251,78 @@ mongoQuery mongo lx rx sr =
       xs -> [field =: xs]
     fLeft   = (\x -> "$gte" =: x) <$> lx
     fRight  = (\x -> "$lte" =: x) <$> rx
-    --typedField v = read (show v) :: ObjectId
 
 
 mongoRun :: Mongo -> Action IO a -> IO (V a)
 mongoRun mongo action = do
   pipe  <- runIOE $ connect $ mongoHost' mongo
-  res   <- access pipe master db $ action
-  return $ left show $ res where
+  res   <- access pipe master db action
+  return $ left show res where
     db = Data.Text.pack $ mongoDatabase mongo
 
 
 mongoOps :: (Show a, Val a) => Mongo -> Ops a
 mongoOps mongo = Ops {
     opsShow = show mongo
-  , opsCount = mongoCount mongo
   , opsBounds = mongoBounds mongo
 }
 
-opsFieldConvBase :: Integer
-opsFieldConvBase = 75
+bounds :: (Ops a, Ops a) -> Maybe a -> Maybe a -> IO (V (OpsBounds a, OpsBounds a))
+bounds (a,b) lx rx = (liftA2 . liftA2)(,) a' b' where
+  a' = opsBounds a lx rx
+  b' = opsBounds b lx rx
 
-opsFieldToInteger :: String -> Integer
-opsFieldToInteger x = Prelude.foldl (\a (i,e) -> e * opsFieldConvBase^i + a) 0 $ Prelude.zip [1..] $ fmap (toInteger . subtract 48 . ord) $ Prelude.reverse x
+globalBounds :: (Ops a, Ops a) -> IO (V (OpsBounds a, OpsBounds a))
+globalBounds ops = bounds ops Nothing Nothing
 
-opsIntegerToField :: Integer -> String
-opsIntegerToField x = fmap (chr . fromIntegral . ((+) 48)) $ Prelude.reverse $ skipZero $ f x where
-  f x = if x <= 0 then [] else (x `mod` opsFieldConvBase) : f (x `div` opsFieldConvBase)
-  skipZero (0:xs) = xs
-  skipZero xs     = xs
+findMissing :: (Pivot a, Show a, Eq a, Ord a) => (Ops a, Ops a) -> Maybe a -> Maybe a -> Int -> EitherT String IO (Set a)
+findMissing (a,b) lx rx depth = do
+  (ax, bx) <- EitherT $ bounds (a,b) lx rx
+  --liftIO $ putStrLn $ ">>> CHECKING " ++ (show lx) ++ " - " ++ (show rx)
+  --liftIO $ print ax
+  --liftIO $ print bx
+  case (ax, bx) of
+    (ax, bx) | ax == bx ->
+      return Set.empty -- liftIO $ print "OK"
 
-opsFieldPivot :: String -> String -> String
-opsFieldPivot a b = opsIntegerToField $ (a' + b') `div` 2 where
-  a' = opsFieldToInteger a
-  b' = opsFieldToInteger b
+    (OpsBounds al ar ac, OpsBounds bl br bc) | (ac + bc) <= 3 -> do
+      liftIO $ putStrLn $ "MISSING: " ++ (show missing)
+      return $ fromMaybe Set.empty $ Set.singleton <$> missing
+        where
+          missing = if al /= bl && ar == br       then al
+                    else if al == bl && ar /= br  then ar
+                    else Nothing
 
-opsGlobalBounds :: Ops a -> OpsBounds a
-opsGlobalBounds ops = opsBounds ops Nothing Nothing
+    (OpsBounds (Just al) (Just ar) ac, OpsBounds (Just bl) (Just br) bc) -> do
+      -- left side
+      --liftIO $ putStrLn $ (show depth) ++ " COUNT MISSMATCH -> LEFT " ++ (show al) ++ " - " ++ (show p)
+      --liftIO $ getLine
+      ls <- findMissing (a,b) (Just al) (Just p) (depth + 1)
+      -- right side
+      --liftIO $ putStrLn $ (show depth) ++ " COUNT MISSMATCH -> RIGHT " ++ (show p) ++ " - " ++ (show ar)
+      --liftIO $ getLine
+      rs <- findMissing (a,b) (Just p) (Just ar) (depth + 1)
 
-opsGlobalCount :: Ops a -> OpsCount
-opsGlobalCount ops = opsCount ops Nothing Nothing
+      return $ Set.union ls rs
 
-runOps :: (Show a) => (Ops a, Ops a) -> IO ()
-runOps (a, b) = do
-  print a
-  putStr " count:  "
-  print =<< opsGlobalCount a
-  putStr " bounds: "
-  print =<< opsGlobalBounds a
+      where
+        p = pivot al ar
 
-  print b
-  putStr " count:  "
-  print =<< opsGlobalCount b
-  putStr " bounds: "
-  print =<< opsGlobalBounds b
+    (ax, bx) -> do
+      liftIO $ putStrLn "MISSMATCH"
+      return Set.empty
 
-
+runOps :: (Pivot a, Show a, Eq a, Ord a) => (Ops a, Ops a) -> IO ()
+runOps os @ (a,b) = do
+  e <- runEitherT $ findMissing (a,b) Nothing Nothing 0
+  case e of
+    Left err -> liftIO $ print $ "ERROR: " ++ err
+    Right ms -> do
+      liftIO $ putStrLn "DONE"
+      liftIO $ putStrLn $ "Found " ++ (show $ Set.size ms) ++ " missing records:"
+      liftIO $ printMissing ms >> return ()
+      where
+        printMissing ms = sequence $ (print) <$> Set.toList ms
 
 
 split :: String -> String -> [String]

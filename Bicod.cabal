@@ -15,14 +15,14 @@ cabal-version:        >=1.8
 
 library
   exposed-modules:    Database.Bicod
-  build-depends:      base, text, curl, bytestring, HTTP, aeson, mongoDB
+  build-depends:      base, text, bytestring, HTTP, aeson, mongoDB, EitherT, mtl, containers
 
 executable bicod
   main-is:            Database/Bicod/Main.hs
   -- other-modules:
-  build-depends:      base, text, curl, bytestring, HTTP, aeson, mongoDB, bicod
+  build-depends:      base, text, bytestring, HTTP, aeson, mongoDB, EitherT, mtl, containers, bicod
 
--- test-suite tests
---   type:               exitcode-stdio-1.0
---   main-is:            test/Spec.hs
---   build-depends:      base, text, hspec
+test-suite tests
+  type:               exitcode-stdio-1.0
+  main-is:            test/Spec.hs
+  build-depends:      base, text, bytestring, HTTP, aeson, mongoDB, EitherT, mtl, containers, bicod, QuickCheck, base, text, hspec
