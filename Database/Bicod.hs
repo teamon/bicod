@@ -1,5 +1,9 @@
-{-# LANGUAGE ExtendedDefaultRules #-}
-{-# LANGUAGE OverloadedStrings    #-}
+{-# LANGUAGE ExtendedDefaultRules   #-}
+{-# LANGUAGE OverloadedStrings      #-}
+{-# LANGUAGE MultiParamTypeClasses  #-}
+{-# LANGUAGE FlexibleContexts       #-}
+{-# LANGUAGE TypeSynonymInstances   #-}
+{-# LANGUAGE FlexibleInstances      #-}
 
 -- https://github.com/selectel/mongoDB-haskell/blob/1.3.2/doc/tutorial.md
 -- https://gist.github.com/teamon/56133b8a96dc1e355b2a
@@ -14,7 +18,10 @@ import           Data.ByteString            (ByteString)
 import qualified Data.ByteString.Lazy.Char8 as C8
 import           Data.Functor
 import           Data.Maybe
-import           Data.Text                  hiding (count, find)
+import           Data.Text                  as T (pack, splitOn, unpack)
+import           Data.Text                  hiding (count, find, split)
+import           Data.Text.Read             (decimal)
+import           Data.Char
 import           Debug.Trace
 
 -- ElasticSearch
@@ -23,17 +30,21 @@ import           Data.Aeson.Types
 import           Network.HTTP
 
 -- MongoDB
-import           Database.MongoDB           hiding (Host, Value)
-import qualified Database.MongoDB           as M
+import           Database.MongoDB           hiding (Host, Value, Field)
+import qualified Database.MongoDB           as M hiding (Field)
 
 
 dbg :: Show a => a -> a
 dbg x = traceShow x x
 
+dbgf :: (Show a, Show b) => String -> (a -> b) -> (a -> b)
+dbgf s f a = trace (s ++ " <-- " ++ show a) $ trace (s ++ " --> " ++ show b) b where
+  b = f a
+
 
 type V a = Either String a
 type Host = (String, Int) -- hostname and port
-type OpsBounds = IO (V (Maybe String, Maybe String))
+type OpsBounds a = IO (V (Maybe a, Maybe a))
 type OpsCount = IO (V Int)
 
 data Sort = ASC | DESC
@@ -46,13 +57,13 @@ instance ToJSON Sort where
   toJSON ASC = "asc"
   toJSON DESC = "desc"
 
-data Ops = Ops {
+data Ops a = Ops {
     opsShow   :: String
-  , opsBounds :: Maybe String -> Maybe String -> OpsBounds
-  , opsCount  :: Maybe String -> Maybe String -> OpsCount
+  , opsBounds :: Maybe a -> Maybe a -> OpsBounds a
+  , opsCount  :: Maybe a -> Maybe a -> OpsCount
 }
 
-instance Show Ops where
+instance Show (Ops a) where
   show = opsShow
 
 
@@ -69,22 +80,22 @@ defaultElasticSearch :: ElasticSearch
 defaultElasticSearch = ElasticSearch ("localhost", 9200) "twitter" "tweet" "id"
 
 
-data EsQueryResult = EsQueryResult {
+data EsQueryResult a = EsQueryResult {
     esTotal :: Int
-  , esHit   :: Maybe String
+  , esHit   :: Maybe a
 } deriving (Show)
 
 
-decodeEsQueryResult :: String -> C8.ByteString -> V EsQueryResult
+decodeEsQueryResult :: (EsConv a) => String -> C8.ByteString -> V (EsQueryResult a)
 decodeEsQueryResult key json = eitherDecode json >>= parseEither parser where
-  parser :: Value -> Parser EsQueryResult
+  --parser :: Value -> Parser (EsQueryResult a)
   parser (Object o) =
     EsQueryResult <$>
       ((o .: "hits") >>= (.: "total")) <*>
       ((o .: "hits") >>= (.: "hits") >>= f) where
-        f :: [Object] -> Data.Aeson.Types.Parser (Maybe String)
+        --f :: [Object] -> Data.Aeson.Types.Parser (Maybe a)
         f xs = case listToMaybe xs of
-              Just o' -> (o' .: "_source") >>= (.: Data.Text.pack key)
+              Just o' -> (o' .: "_source") >>= (.: Data.Text.pack key) >>= (\m -> return $ m >>= esConvFrom)
               _       -> return Nothing
 
 esHostString :: ElasticSearch -> String
@@ -94,7 +105,7 @@ esURI :: ElasticSearch -> String
 esURI es @ (ElasticSearch (host, port) index tp _) =
   "http://" ++ esHostString es ++ "/" ++ index ++ "/" ++ tp
 
-esSearchQuery :: ElasticSearch -> Maybe String -> Maybe String -> Sort -> IO (V EsQueryResult)
+esSearchQuery :: (EsConv a) => ElasticSearch -> Maybe a -> Maybe a -> Sort -> IO (V (EsQueryResult a))
 esSearchQuery es left right sort = parse <$> httpPOST uri headers body where
   uri = esURI es ++ "/_search"
   parse res = res >>= (decodeEsQueryResult field . C8.pack)
@@ -108,8 +119,8 @@ esSearchQuery es left right sort = parse <$> httpPOST uri headers body where
   jsQuery = object ["range" .= jsRange]
   jsRange = object [Data.Text.pack field .= jsRargs]
   jsRargs = object $ catMaybes [jsLeft, jsRight]
-  jsLeft  = ("gte" .=) <$> left
-  jsRight = ("lte" .=) <$> right
+  jsLeft  = ("gte" .=) . esConvTo <$> left
+  jsRight = ("lte" .=) . esConvTo <$> right
 
   field = esField es
   headers = [
@@ -134,17 +145,32 @@ httpRequest method uri headers body = do
       (2, _, _) -> Right body
       _         -> Left body
 
-esCount :: ElasticSearch -> Maybe String -> Maybe String -> OpsCount
+
+class EsConv a where
+  esConvTo   :: a -> String
+  esConvFrom :: String -> Maybe a
+
+instance EsConv String where
+  esConvTo = id
+  esConvFrom = id . Just
+
+instance EsConv ObjectId where
+  esConvTo = show
+  esConvFrom v = fst <$> (listToMaybe $ reads v)
+
+
+esCount :: (EsConv a) => ElasticSearch -> Maybe a -> Maybe a -> OpsCount
 esCount es left right = (esTotal <$>) <$> esSearchQuery es left right ASC
 
-esBounds :: ElasticSearch -> Maybe String -> Maybe String -> OpsBounds
+esBounds :: (EsConv a) => ElasticSearch -> Maybe a -> Maybe a -> OpsBounds a
 esBounds es left right = (cm <$>) <$> (liftA2 . liftA2)(,) lx rx where
-  lx = esSearchQuery es left right ASC
-  rx = esSearchQuery es left right DESC
+  lx = query ASC
+  rx = query DESC
+  query = esSearchQuery es left right
   cm (EsQueryResult _ lh, EsQueryResult _ rh) = (lh, rh)
 
 
-esOps :: ElasticSearch -> Ops
+esOps :: (Show a, EsConv a) => ElasticSearch -> Ops a
 esOps es = Ops {
     opsShow = show es
   , opsCount = esCount es
@@ -172,20 +198,23 @@ mongoHost' (Mongo (host, port) _ _ _) =
 defaultMongo :: Mongo
 defaultMongo = Mongo ("localhost", 27017) "test" "test" "_id"
 
-mongoCount :: Mongo -> Maybe String -> Maybe String -> OpsCount
+mongoCount :: (Show a, Val a) => Mongo -> Maybe a -> Maybe a -> OpsCount
 mongoCount mongo left right = mongoRun mongo $ action where
   action = count $ (mongoQuery mongo left right ASC)
 
-mongoBounds :: Mongo -> Maybe String -> Maybe String -> OpsBounds
+mongoBounds :: (Show a, Val a) => Mongo -> Maybe a -> Maybe a -> OpsBounds a
 mongoBounds mongo left right = (liftA2 . liftA2)(,) lx rx where
   lx = run ASC
   rx = run DESC
-  run s = ((firstKey <$>) <$>) $ mongoRun mongo $ act s >>= rest
-  act s = find $ (mongoQuery mongo left right s) { limit = 1}
-  firstKey ds = show <$> ((listToMaybe ds) >>= M.look field)
+  run s = ((getField <$>) <$>) $ mongoRun mongo $ act s
+  act s = findOne $ (mongoQuery mongo left right s) { limit = 1}
+  --firstKey :: (Show a, Read a) => [Document] -> Maybe a
+  --firstKey ds = dbgf "read" read <$> firstKey' ds
+  --getField :: (Val a) => Maybe Document -> Maybe a
+  getField doc = doc >>= M.look field >>= cast'
   field = Data.Text.pack (mongoField mongo)
 
-mongoQuery :: Mongo -> Maybe String -> Maybe String -> Sort -> Query
+mongoQuery :: (Show a, Val a) => Mongo -> Maybe a -> Maybe a -> Sort -> Query
 mongoQuery mongo lx rx sr =
   (select filt col) { project = [field =: 1], sort = [field =: sortInt sr] } where
     col     = Data.Text.pack $ mongoCollection mongo
@@ -193,9 +222,9 @@ mongoQuery mongo lx rx sr =
     filt    = case catMaybes [fLeft, fRight] of
       [] -> []
       xs -> [field =: xs]
-    fLeft   = (\x -> "$gte" =: typedField x) <$> lx
-    fRight  = (\x -> "$lte" =: typedField x) <$> rx
-    typedField v = read v :: ObjectId
+    fLeft   = (\x -> "$gte" =: x) <$> lx
+    fRight  = (\x -> "$lte" =: x) <$> rx
+    --typedField v = read (show v) :: ObjectId
 
 
 mongoRun :: Mongo -> Action IO a -> IO (V a)
@@ -206,24 +235,37 @@ mongoRun mongo action = do
     db = Data.Text.pack $ mongoDatabase mongo
 
 
-mongoOps :: Mongo -> Ops
+mongoOps :: (Show a, Val a) => Mongo -> Ops a
 mongoOps mongo = Ops {
     opsShow = show mongo
   , opsCount = mongoCount mongo
   , opsBounds = mongoBounds mongo
 }
 
+opsFieldConvBase :: Integer
+opsFieldConvBase = 75
 
+opsFieldToInteger :: String -> Integer
+opsFieldToInteger x = Prelude.foldl (\a (i,e) -> e * opsFieldConvBase^i + a) 0 $ Prelude.zip [1..] $ fmap (toInteger . subtract 48 . ord) $ Prelude.reverse x
 
+opsIntegerToField :: Integer -> String
+opsIntegerToField x = fmap (chr . fromIntegral . ((+) 48)) $ Prelude.reverse $ skipZero $ f x where
+  f x = if x <= 0 then [] else (x `mod` opsFieldConvBase) : f (x `div` opsFieldConvBase)
+  skipZero (0:xs) = xs
+  skipZero xs     = xs
 
+opsFieldPivot :: String -> String -> String
+opsFieldPivot a b = opsIntegerToField $ (a' + b') `div` 2 where
+  a' = opsFieldToInteger a
+  b' = opsFieldToInteger b
 
-opsGlobalBounds :: Ops -> OpsBounds
+opsGlobalBounds :: Ops a -> OpsBounds a
 opsGlobalBounds ops = opsBounds ops Nothing Nothing
 
-opsGlobalCount :: Ops -> OpsCount
+opsGlobalCount :: Ops a -> OpsCount
 opsGlobalCount ops = opsCount ops Nothing Nothing
 
-runOps :: (Ops, Ops) -> IO ()
+runOps :: (Show a) => (Ops a, Ops a) -> IO ()
 runOps (a, b) = do
   print a
   putStr " count:  "
@@ -236,5 +278,49 @@ runOps (a, b) = do
   print =<< opsGlobalCount b
   putStr " bounds: "
   print =<< opsGlobalBounds b
+
+
+
+
+split :: String -> String -> [String]
+split d s = fmap T.unpack $ splitOn (T.pack d) (T.pack s)
+
+getOpsFromURI :: String -> V (Ops ObjectId)
+getOpsFromURI str = case split "://" str of
+  ["mongo", rest] -> mongoOps <$> parseMongoURI rest
+  ["es", rest]    -> esOps    <$> parseElasticSearchURI rest
+  [driver, _]     -> Left $ "Unknown driver " ++ driver
+  _               -> Left $ "Invalid database URI: " ++ str
+
+
+-- Example: mongo://host:port/dbname/collection/field
+parseMongoURI :: String -> V Mongo
+parseMongoURI uri = case parseURIParts uri of
+  [host, db, coll, field] -> (\h -> Mongo h db coll field) <$> parseHost 27017 host
+  _                       -> Left $ "Invalid MongoDB URI " ++ uri
+
+
+-- Example: es://host:port/index/field
+parseElasticSearchURI :: String -> V ElasticSearch
+parseElasticSearchURI uri = case parseURIParts uri of
+  [host, index, tp, field]  -> (\h -> ElasticSearch h index tp field) <$> parseHost 9200 host
+  _                         -> Left $ "Invalid ElasticSearch URI " ++ uri
+
+
+parseURIParts :: String -> [String]
+parseURIParts = split "/"
+
+
+parseHost :: Int -> String -> V (String, Int)
+parseHost defaultPort str = case split ":" str of
+  [host, port]  -> (,) host . fst <$> decimal (T.pack port)
+  [host]        -> Right (host, defaultPort)
+  _             -> Left $ "Invalid host: " ++ str
+
+
+runBicod :: [String] -> IO ()
+runBicod argv = either putStrLn runOps $ getOps argv where
+  getOps [a, b] = liftA2 (,) (getOpsFromURI a) (getOpsFromURI b)
+  getOps _ = Left "USAGE: bicod URI URI"
 
 
