@@ -1,6 +1,6 @@
 # Bicod
 
-### Binary Company Databases
+### Binary Compare Databases
 
 Binary search for missing records between two databases.
 
